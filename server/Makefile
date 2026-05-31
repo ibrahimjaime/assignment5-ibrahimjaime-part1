@@ -3,7 +3,7 @@ CFLAGS = -Wall -Werror
 
 all: aesdsocket
 
-writer: aesdsocket.c
+aesdsocket: aesdsocket.c
 	$(CC) $(CFLAGS) aesdsocket.c -o aesdsocket
 
 clean:
