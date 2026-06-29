@@ -9,12 +9,38 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <pthread.h>
+#include <sys/queue.h>
+#include <time.h> 
+
+#include <sys/queue.h>
+#include <time.h>
+
+#ifndef SLIST_FOREACH_SAFE
+#define SLIST_FOREACH_SAFE(var, head, field, tvar) \
+    for ((var) = SLIST_FIRST((head));              \
+         (var) && ((tvar) = SLIST_NEXT((var), field), 1); \
+         (var) = (tvar))
+#endif
+
 
 #define BUFFER_SIZE 1024
 #define FILE_PATH "/var/tmp/aesdsocketdata"
 
 volatile sig_atomic_t keep_running = 1;
 int server_fd = -1;
+
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct thread_data {
+    pthread_t thread_id;
+    int client_fd;
+    struct sockaddr_in client_addr;
+    int is_complete;
+    SLIST_ENTRY(thread_data) entries;
+} thread_data_t;
+
+SLIST_HEAD(slisthead, thread_data) thread_list_head = SLIST_HEAD_INITIALIZER(thread_list_head);
 
 void signal_handler(int signal_number) {
     if (signal_number == SIGINT || signal_number == SIGTERM) {
@@ -28,30 +54,65 @@ void signal_handler(int signal_number) {
 }
 
 int append_to_file(const char *data, size_t length) {
+    pthread_mutex_lock(&file_mutex);
     FILE *file = fopen(FILE_PATH, "a");
     if (file == NULL) {
         perror("Error opening or creating file");
         syslog(LOG_ERR, "Failed to open file: %s", FILE_PATH);
+        pthread_mutex_unlock(&file_mutex);
         return -1;
     }
     size_t written = fwrite(data, 1, length, file);
     fclose(file);
+    pthread_mutex_unlock(&file_mutex);
     return (written == length) ? 0 : -1;
 }
 
-void handle_client_data(int client_fd) {
+void* timer_thread_function(void* arg) {
+    (void)arg;
+    time_t rawtime;
+    struct tm *timeinfo;
+    char time_buf[100];
+    char final_buf[150];
+
+    while (keep_running) {
+        for (int i = 0; i < 10 && keep_running; i++) {
+            sleep(1);
+        }
+        
+        if (!keep_running) break;
+
+        time(&rawtime);
+        timeinfo = localtime(&rawtime);
+
+        if (strftime(time_buf, sizeof(time_buf), "%a, %d %b %Y %T %z", timeinfo) != 0) {
+            int len = snprintf(final_buf, sizeof(final_buf), "timestamp: %s\n", time_buf);
+            if (len > 0) {
+                append_to_file(final_buf, len);
+            }
+        }
+    }
+    return NULL;
+}
+
+void* thread_function(void* thread_param) {
+    thread_data_t *data = (thread_data_t *)thread_param;
     char read_buf[BUFFER_SIZE];
     char *packet_buf = NULL;
     size_t packet_len = 0;
 
+    char ipstr[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(data->client_addr.sin_addr), ipstr, sizeof(ipstr));
+    syslog(LOG_INFO, "Accepted connection from %s", ipstr);
+
     while (keep_running) {
-        ssize_t bytes_received = recv(client_fd, read_buf, BUFFER_SIZE, 0);
+        ssize_t bytes_received = recv(data->client_fd, read_buf, BUFFER_SIZE, 0);
         if (bytes_received > 0) {
             char *new_ptr = realloc(packet_buf, packet_len + bytes_received);
             if (new_ptr == NULL) {
                 perror("Memory allocation error (realloc). Packet discarded.");
                 free(packet_buf);
-                return;
+                break;
             }
             packet_buf = new_ptr;
             memcpy(packet_buf + packet_len, read_buf, bytes_received);
@@ -61,17 +122,21 @@ void handle_client_data(int client_fd) {
             for (size_t i = 0; i < packet_len; i++) {
                 if (packet_buf[i] == '\n') {
                     size_t current_packet_size = (i - start_idx) + 1;
+                    
                     append_to_file(packet_buf + start_idx, current_packet_size);
 
+                    pthread_mutex_lock(&file_mutex);
                     FILE *file = fopen(FILE_PATH, "r");
                     if (file != NULL) {
                         char send_buf[BUFFER_SIZE];
                         size_t bytes_read;
                         while ((bytes_read = fread(send_buf, 1, BUFFER_SIZE, file)) > 0) {
-                            send(client_fd, send_buf, bytes_read, 0);
+                            send(data->client_fd, send_buf, bytes_read, 0);
                         }
                         fclose(file);
                     }
+                    pthread_mutex_unlock(&file_mutex);
+                    
                     start_idx = i + 1;
                 }
             }
@@ -91,7 +156,12 @@ void handle_client_data(int client_fd) {
             break; 
         }
     }
+
     if (packet_buf != NULL) free(packet_buf);
+    close(data->client_fd);
+    syslog(LOG_INFO, "Closed connection from %s", ipstr);
+    data->is_complete = 1;
+    return thread_param;
 }
 
 int main(int argc, char *argv[]) {
@@ -137,34 +207,29 @@ int main(int argc, char *argv[]) {
 
     if (daemon_mode) {
         pid_t pid = fork();
-
         if (pid < 0) {
             perror("Fork failure");
             close(server_fd);
             closelog();
             return -1;
         }
-
         if (pid > 0) {
             close(server_fd);
             closelog();
             return 0; 
         }
-
         if (setsid() < 0) {
             perror("Setsid failure");
             close(server_fd);
             closelog();
             return -1;
         }
-
         if (chdir("/") < 0) {
             perror("Chdir failure");
             close(server_fd);
             closelog();
             return -1;
         }
-
         int dev_null = open("/dev/null", O_RDWR);
         if (dev_null >= 0) {
             dup2(dev_null, STDIN_FILENO);
@@ -174,6 +239,14 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    pthread_t timer_thread;
+    if (pthread_create(&timer_thread, NULL, timer_thread_function, NULL) != 0) {
+        perror("Timer thread creation error");
+        close(server_fd);
+        closelog();
+        return -1;
+    }
+
     if (listen(server_fd, 10) < 0) {
         perror("Socket listen error");
         close(server_fd);
@@ -181,8 +254,7 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    printf("Server listening on port 9000. Press Ctrl+C to exit gracefully...\n");
-
+    SLIST_INIT(&thread_list_head);
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
 
@@ -193,20 +265,52 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        char ipstr[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, ipstr, sizeof(ipstr));
-        syslog(LOG_INFO, "Accepted connection from %s", ipstr);
+        thread_data_t *node = malloc(sizeof(thread_data_t));
+        if (node == NULL) {
+            perror("Failed to allocate memory for thread context");
+            close(client_fd);
+            continue;
+        }
 
-        handle_client_data(client_fd);
+        node->client_fd = client_fd;
+        node->client_addr = client_addr;
+        node->is_complete = 0;
 
-        close(client_fd);
-        syslog(LOG_INFO, "Closed connection from %s", ipstr);
+        if (pthread_create(&(node->thread_id), NULL, thread_function, node) != 0) {
+            perror("pthread_create failure");
+            close(client_fd);
+            free(node);
+            continue;
+        }
+
+        SLIST_INSERT_HEAD(&thread_list_head, node, entries);
+
+        thread_data_t *thread_curr;
+        thread_data_t *thread_temp;
+        SLIST_FOREACH_SAFE(thread_curr, &thread_list_head, entries, thread_temp) {
+            if (thread_curr->is_complete) {
+                pthread_join(thread_curr->thread_id, NULL);
+                SLIST_REMOVE(&thread_list_head, thread_curr, thread_data, entries);
+                free(thread_curr);
+            }
+        }
     }
 
     if (server_fd != -1) {
         close(server_fd);
     }
 
+    pthread_join(timer_thread, NULL);
+
+    thread_data_t *thread_curr;
+    while (!SLIST_EMPTY(&thread_list_head)) {
+        thread_curr = SLIST_FIRST(&thread_list_head);
+        pthread_join(thread_curr->thread_id, NULL);
+        SLIST_REMOVE_HEAD(&thread_list_head, entries);
+        free(thread_curr);
+    }
+
+    pthread_mutex_destroy(&file_mutex);
     unlink(FILE_PATH);
     closelog();
     return 0;
