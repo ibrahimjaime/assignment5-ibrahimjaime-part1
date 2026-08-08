@@ -23,9 +23,17 @@
          (var) = (tvar))
 #endif
 
-
 #define BUFFER_SIZE 1024
+
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
+#if USE_AESD_CHAR_DEVICE
+#define FILE_PATH "/dev/aesdchar"
+#else
 #define FILE_PATH "/var/tmp/aesdsocketdata"
+#endif
 
 volatile sig_atomic_t keep_running = 1;
 int server_fd = -1;
@@ -70,6 +78,12 @@ int append_to_file(const char *data, size_t length) {
 
 void* timer_thread_function(void* arg) {
     (void)arg;
+#if USE_AESD_CHAR_DEVICE
+    while (keep_running) {
+        sleep(1);
+    }
+    return NULL;
+#else
     time_t rawtime;
     struct tm *timeinfo;
     char time_buf[100];
@@ -93,6 +107,7 @@ void* timer_thread_function(void* arg) {
         }
     }
     return NULL;
+#endif
 }
 
 void* thread_function(void* thread_param) {
@@ -311,7 +326,9 @@ int main(int argc, char *argv[]) {
     }
 
     pthread_mutex_destroy(&file_mutex);
+#if !USE_AESD_CHAR_DEVICE
     unlink(FILE_PATH);
+#endif
     closelog();
     return 0;
 }
