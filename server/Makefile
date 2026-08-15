@@ -1,6 +1,6 @@
 CC ?= $(CROSS_COMPILE)gcc
 CFLAGS ?= -Wall -Werror
-CFLAGS += -I../aesd-char-driver
+override CFLAGS += -I../aesd-char-driver
 LDFLAGS += $(TARGET_LDFLAGS)
 
 all: aesdsocket
