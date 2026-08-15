@@ -27,6 +27,10 @@
 #  define PDEBUG(fmt, args...) /* not debugging: nothing */
 #endif
 
+loff_t aesd_llseek(struct file *filp, loff_t offset, int whence);
+
+long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
+
 struct aesd_dev
 {
     /**

@@ -16,6 +16,11 @@
 #include <sys/queue.h>
 #include <time.h>
 
+#include <sys/ioctl.h>
+#include <errno.h>
+#include <stdbool.h>
+#include "aesd_ioctl.h"
+
 #ifndef SLIST_FOREACH_SAFE
 #define SLIST_FOREACH_SAFE(var, head, field, tvar) \
     for ((var) = SLIST_FIRST((head));              \
@@ -49,6 +54,33 @@ typedef struct thread_data {
 } thread_data_t;
 
 SLIST_HEAD(slisthead, thread_data) thread_list_head = SLIST_HEAD_INITIALIZER(thread_list_head);
+
+#if USE_AESD_CHAR_DEVICE
+static bool parse_seekto_command(const char *line, size_t len, struct aesd_seekto *seekto)
+{
+    static const char prefix[] = "AESDCHAR_IOCSEEKTO:";
+    size_t prefix_len = strlen(prefix);
+    char tmp[128];
+    size_t copy_len;
+    unsigned int x, y;
+
+    if (len <= prefix_len || strncmp(line, prefix, prefix_len) != 0) {
+        return false;
+    }
+
+    copy_len = (len < sizeof(tmp) - 1) ? len : sizeof(tmp) - 1;
+    memcpy(tmp, line, copy_len);
+    tmp[copy_len] = '\0';
+
+    if (sscanf(tmp + prefix_len, "%u,%u", &x, &y) != 2) {
+        return false;
+    }
+
+    seekto->write_cmd = x;
+    seekto->write_cmd_offset = y;
+    return true;
+}
+#endif
 
 void signal_handler(int signal_number) {
     if (signal_number == SIGINT || signal_number == SIGTERM) {
@@ -137,21 +169,59 @@ void* thread_function(void* thread_param) {
             for (size_t i = 0; i < packet_len; i++) {
                 if (packet_buf[i] == '\n') {
                     size_t current_packet_size = (i - start_idx) + 1;
-                    
-                    append_to_file(packet_buf + start_idx, current_packet_size);
+                    char *line = packet_buf + start_idx;
+                    bool handled_as_seek = false;
 
-                    pthread_mutex_lock(&file_mutex);
-                    FILE *file = fopen(FILE_PATH, "r");
-                    if (file != NULL) {
-                        char send_buf[BUFFER_SIZE];
-                        size_t bytes_read;
-                        while ((bytes_read = fread(send_buf, 1, BUFFER_SIZE, file)) > 0) {
-                            send(data->client_fd, send_buf, bytes_read, 0);
+            #if USE_AESD_CHAR_DEVICE
+                    struct aesd_seekto seekto;
+                    if (parse_seekto_command(line, current_packet_size, &seekto)) {
+                        handled_as_seek = true;
+
+                        pthread_mutex_lock(&file_mutex);
+
+                        /* Requirement 1.5: single fd used for BOTH the ioctl and the
+                        * subsequent read, so f_pos set by the ioctl is honored */
+                        int fd = open(FILE_PATH, O_RDWR);
+                        if (fd < 0) {
+                            perror("Error opening aesdchar device for ioctl");
+                            syslog(LOG_ERR, "Failed to open %s for ioctl: %s", FILE_PATH, strerror(errno));
+                        } else {
+                            if (ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) != 0) {
+                                syslog(LOG_ERR, "ioctl AESDCHAR_IOCSEEKTO failed: %s", strerror(errno));
+                            } else {
+                                /* Requirement 1.4: send device content back over the
+                                * socket, starting from the seeked position */
+                                char send_buf[BUFFER_SIZE];
+                                ssize_t bytes_read;
+                                while ((bytes_read = read(fd, send_buf, BUFFER_SIZE)) > 0) {
+                                    send(data->client_fd, send_buf, bytes_read, 0);
+                                }
+                            }
+                            close(fd);
                         }
-                        fclose(file);
+
+                        pthread_mutex_unlock(&file_mutex);
                     }
-                    pthread_mutex_unlock(&file_mutex);
-                    
+            #endif
+
+                    if (!handled_as_seek) {
+                        /* Requirement 1.3 (implicitly satisfied): only reached for
+                        * normal lines, never for AESDCHAR_IOCSEEKTO commands */
+                        append_to_file(line, current_packet_size);
+
+                        pthread_mutex_lock(&file_mutex);
+                        FILE *file = fopen(FILE_PATH, "r");
+                        if (file != NULL) {
+                            char send_buf[BUFFER_SIZE];
+                            size_t bytes_read;
+                            while ((bytes_read = fread(send_buf, 1, BUFFER_SIZE, file)) > 0) {
+                                send(data->client_fd, send_buf, bytes_read, 0);
+                            }
+                            fclose(file);
+                        }
+                        pthread_mutex_unlock(&file_mutex);
+                    }
+
                     start_idx = i + 1;
                 }
             }
